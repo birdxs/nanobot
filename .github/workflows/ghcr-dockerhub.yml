@@ -1,4 +1,4 @@
-name: Build and Push Multi-Arch Docker Images 2026.2.4同时推送镜像至ghcr和dockerhub
+name: Build and Push Multi-Arch Docker Images 2026.2.4
 
 on:
   workflow_dispatch:
@@ -11,9 +11,7 @@ on:
 env:
   GHCR_REGISTRY: ghcr.io
   DOCKERHUB_REGISTRY: docker.io
-  # GitHub 仓库全名作为 GHCR 镜像名
   GHCR_IMAGE_NAME: ${{ github.repository }}
-  # Docker Hub 镜像名（需要根据实际情况设置）
   DOCKERHUB_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
 
 jobs:
@@ -38,7 +36,7 @@ jobs:
       - name: Set up QEMU for multi-platform build
         uses: docker/setup-qemu-action@v3
 
-      # 登录到 GHCR
+      # 登录 GHCR
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -46,7 +44,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 登录到 Docker Hub（需要预先设置 secrets.DOCKERHUB_USERNAME 和 secrets.DOCKERHUB_TOKEN）
+      # 登录 Docker Hub
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -54,7 +52,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 为 GHCR 生成元数据
+      # 为 GHCR 生成元数据（标签、标签）
       - name: Extract metadata for GHCR
         id: meta-ghcr
         uses: docker/metadata-action@v5
@@ -66,7 +64,7 @@ jobs:
           flavor: |
             latest=true
 
-      # 为 Docker Hub 生成元数据
+      # 为 Docker Hub 生成元数据（仅用于标签，标签与 GHCR 共用）
       - name: Extract metadata for Docker Hub
         id: meta-dockerhub
         uses: docker/metadata-action@v5
@@ -79,6 +77,7 @@ jobs:
             latest=true
 
       # 构建并推送多架构镜像到两个注册表
+      # 注意：labels 使用了 meta-ghcr 生成的 labels，它们会嵌入镜像，因此两个仓库都会包含这些元数据
       - name: Build and push multi-arch images
         uses: docker/build-push-action@v5
         with:
@@ -92,6 +91,18 @@ jobs:
           labels: ${{ steps.meta-ghcr.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ---------- 新增：同步项目摘要到 Docker Hub 仓库描述 ----------
+      - name: Update Docker Hub repository description
+        uses: peter-evans/dockerhub-description@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE_NAME }}
+          readme-filepath: ./README.md   # 若 README 不在根目录或名称不同请调整
+          # 可选：如果希望将某些 OCI 标签作为描述的一部分，可自定义 short-description
+          # short-description: ${{ steps.meta-ghcr.outputs.labels['org.opencontainers.image.description'] }}
+      # -------------------------------------------------------------
 
       - name: Generate summary
         run: |
