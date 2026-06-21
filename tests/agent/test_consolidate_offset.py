@@ -1,10 +1,11 @@
 """Test session management with cache-friendly message handling."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pathlib import Path
+
 from nanobot.session.manager import Session, SessionManager
 
 # Test constants
@@ -506,7 +507,7 @@ class TestNewCommandArchival:
 
     @pytest.mark.asyncio
     async def test_new_clears_session_immediately_even_if_archive_fails(self, tmp_path: Path) -> None:
-        """/new clears session immediately; archive_messages retries until raw dump."""
+        """/new clears session immediately; archive is fire-and-forget."""
         from nanobot.bus.events import InboundMessage
 
         loop = self._make_loop(tmp_path)
@@ -518,12 +519,13 @@ class TestNewCommandArchival:
 
         call_count = 0
 
-        async def _failing_consolidate(_messages) -> bool:
+        async def _failing_summarize(_messages, *, session_key=None) -> bool:
             nonlocal call_count
+            assert session_key == "cli:test"
             call_count += 1
             return False
 
-        loop.memory_consolidator.consolidate_messages = _failing_consolidate  # type: ignore[method-assign]
+        loop.consolidator.archive = _failing_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
@@ -535,7 +537,7 @@ class TestNewCommandArchival:
         assert len(session_after.messages) == 0
 
         await loop.close_mcp()
-        assert call_count == 3  # retried up to raw-archive threshold
+        assert call_count == 1
 
     @pytest.mark.asyncio
     async def test_new_archives_only_unconsolidated_messages(self, tmp_path: Path) -> None:
@@ -550,13 +552,15 @@ class TestNewCommandArchival:
         loop.sessions.save(session)
 
         archived_count = -1
+        archived_session_key = None
 
-        async def _fake_consolidate(messages) -> bool:
-            nonlocal archived_count
+        async def _fake_summarize(messages, *, session_key=None) -> bool:
+            nonlocal archived_count, archived_session_key
             archived_count = len(messages)
+            archived_session_key = session_key
             return True
 
-        loop.memory_consolidator.consolidate_messages = _fake_consolidate  # type: ignore[method-assign]
+        loop.consolidator.archive = _fake_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
@@ -566,6 +570,7 @@ class TestNewCommandArchival:
 
         await loop.close_mcp()
         assert archived_count == 3
+        assert archived_session_key == "cli:test"
 
     @pytest.mark.asyncio
     async def test_new_clears_session_and_responds(self, tmp_path: Path) -> None:
@@ -578,10 +583,11 @@ class TestNewCommandArchival:
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
 
-        async def _ok_consolidate(_messages) -> bool:
+        async def _ok_summarize(_messages, *, session_key=None) -> bool:
+            assert session_key == "cli:test"
             return True
 
-        loop.memory_consolidator.consolidate_messages = _ok_consolidate  # type: ignore[method-assign]
+        loop.consolidator.archive = _ok_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
@@ -603,17 +609,20 @@ class TestNewCommandArchival:
         loop.sessions.save(session)
 
         archived = asyncio.Event()
+        release_archive = asyncio.Event()
 
-        async def _slow_consolidate(_messages) -> bool:
-            await asyncio.sleep(0.1)
+        async def _slow_summarize(_messages, *, session_key=None) -> bool:
+            assert session_key == "cli:test"
+            await release_archive.wait()
             archived.set()
             return True
 
-        loop.memory_consolidator.consolidate_messages = _slow_consolidate  # type: ignore[method-assign]
+        loop.consolidator.archive = _slow_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         await loop._process_message(new_msg)
 
         assert not archived.is_set()
+        release_archive.set()
         await loop.close_mcp()
         assert archived.is_set()
