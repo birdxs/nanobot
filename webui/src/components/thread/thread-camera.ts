@@ -1,49 +1,6 @@
-interface ThreadCameraMotionProfile {
-  /**
-   * Time constant for the ease-out chase. Smaller values react faster; the
-   * camera closes roughly 95% of an uncapped distance in three time constants.
-   */
-  responseTimeMs: number;
-  /** Prevents a large completion batch from turning into a one-frame jump. */
-  maxSpeedPxPerSecond: number;
-  /** Avoids spending frames chasing sub-pixel layout noise. */
-  settleDistancePx: number;
-  /** Limits catch-up after a throttled or backgrounded animation frame. */
-  maxFrameDeltaMs: number;
-}
-
-const THREAD_CAMERA_FOLLOW_MOTION: Readonly<ThreadCameraMotionProfile> = {
-  responseTimeMs: 90,
-  maxSpeedPxPerSecond: 1_200,
-  settleDistancePx: 0.5,
-  maxFrameDeltaMs: 50,
-};
-
-const THREAD_CAMERA_NAVIGATION_MOTION: Readonly<ThreadCameraMotionProfile> = {
-  responseTimeMs: 110,
-  maxSpeedPxPerSecond: 12_000,
-  settleDistancePx: 0.5,
-  maxFrameDeltaMs: 50,
-};
-
-/**
- * Reduced motion still preserves spatial continuity. Snapping a long thread
- * to its destination removes the very context that helps users understand
- * where the viewport moved; this profile shortens that motion instead.
- */
-const THREAD_CAMERA_REDUCED_MOTION: Readonly<ThreadCameraMotionProfile> = {
-  responseTimeMs: 55,
-  maxSpeedPxPerSecond: 2_400,
-  settleDistancePx: 0.5,
-  maxFrameDeltaMs: 50,
-};
-
-const THREAD_CAMERA_REDUCED_NAVIGATION_MOTION: Readonly<ThreadCameraMotionProfile> = {
-  responseTimeMs: 45,
-  maxSpeedPxPerSecond: 24_000,
-  settleDistancePx: 0.5,
-  maxFrameDeltaMs: 50,
-};
+const NAVIGATION_DURATION_MS = 220;
+const REDUCED_NAVIGATION_DURATION_MS = 80;
+const SETTLE_DISTANCE_PX = 0.5;
 
 export interface ThreadCameraViewport {
   scrollTop: number;
@@ -61,29 +18,6 @@ export type ThreadCameraFollowResult = "started" | "retargeted" | "settled";
 interface ThreadCameraOptions {
   scheduler?: ThreadCameraScheduler;
   prefersReducedMotion?: () => boolean;
-}
-
-type ThreadCameraMotionKind = "follow" | "navigation";
-
-/**
- * A time-based ease-out chase rather than a start/end tween. The target can
- * move on every streamed line without restarting a duration or adding another
- * frame loop.
- */
-function easeOutChase(
-  current: number,
-  target: number,
-  deltaSeconds: number,
-  profile: Pick<ThreadCameraMotionProfile, "responseTimeMs" | "maxSpeedPxPerSecond">,
-): number {
-  const distance = target - current;
-  const responseSeconds = Math.max(0.001, profile.responseTimeMs / 1000);
-  const timeStep = Math.max(0.001, deltaSeconds);
-  const easeOutFraction = 1 - Math.exp(-timeStep / responseSeconds);
-  const uncappedStep = distance * easeOutFraction;
-  const maxStep = Math.max(0, profile.maxSpeedPxPerSecond) * timeStep;
-  const step = Math.max(-maxStep, Math.min(maxStep, uncappedStep));
-  return current + step;
 }
 
 function defaultScheduler(): ThreadCameraScheduler {
@@ -108,7 +42,7 @@ export class ThreadCameraController {
   private phase: "idle" | "following" = "idle";
   private target = 0;
   private lastTimestamp: number | null = null;
-  private motionKind: ThreadCameraMotionKind = "follow";
+  private deadline = 0;
 
   constructor(
     getViewport: () => ThreadCameraViewport | null,
@@ -131,35 +65,43 @@ export class ThreadCameraController {
     this.write(viewport, this.target);
   }
 
+  /**
+   * Automatic follow is a layout constraint, not navigation. Resolve it in
+   * the geometry frame so streamed content and viewport resizing cannot build
+   * up hidden travel below the visible tail.
+   */
   followTo(top: number): ThreadCameraFollowResult | null {
-    return this.moveTo(top, "follow");
+    const viewport = this.getViewport();
+    if (!viewport) return null;
+    this.cancel();
+    this.target = Math.max(0, top);
+    this.write(viewport, this.target);
+    return "settled";
   }
 
   navigateTo(top: number): ThreadCameraFollowResult | null {
-    return this.moveTo(top, "navigation");
+    return this.moveTo(top);
   }
 
-  private moveTo(
-    top: number,
-    motionKind: ThreadCameraMotionKind,
-  ): ThreadCameraFollowResult | null {
+  private moveTo(top: number): ThreadCameraFollowResult | null {
     const viewport = this.getViewport();
     if (!viewport) return null;
     const current = viewport.scrollTop;
     this.target = Math.max(0, top);
-    this.motionKind = motionKind;
 
-    const motion = this.currentMotion(motionKind);
     if (this.phase === "following") {
       return "retargeted";
     }
-    if (Math.abs(this.target - current) <= motion.settleDistancePx) {
+    if (Math.abs(this.target - current) <= SETTLE_DISTANCE_PX) {
       this.write(viewport, this.target);
       return "settled";
     }
 
     this.phase = "following";
     this.lastTimestamp = this.scheduler.now();
+    this.deadline = this.lastTimestamp + (this.prefersReducedMotion()
+      ? REDUCED_NAVIGATION_DURATION_MS
+      : NAVIGATION_DURATION_MS);
     this.frameId = this.scheduler.request(this.advance);
     return "started";
   }
@@ -171,7 +113,6 @@ export class ThreadCameraController {
     }
     this.phase = "idle";
     this.lastTimestamp = null;
-    this.motionKind = "follow";
   }
 
   dispose(): void {
@@ -186,50 +127,21 @@ export class ThreadCameraController {
       return;
     }
 
-    const motion = this.currentMotion(this.motionKind);
-    const previousTimestamp = this.lastTimestamp ?? timestamp - (1000 / 60);
-    const deltaMs = Math.min(
-      motion.maxFrameDeltaMs,
-      Math.max(1, timestamp - previousTimestamp),
-    );
-    this.lastTimestamp = timestamp;
-    const current = viewport.scrollTop;
-    const remainingDistance = this.target - current;
-    if (Math.abs(remainingDistance) <= motion.settleDistancePx) {
+    const previousTimestamp = this.lastTimestamp ?? timestamp;
+    const remainingMs = Math.max(0, this.deadline - timestamp);
+    if (remainingMs === 0) {
       this.write(viewport, this.target);
-      this.phase = "idle";
-      this.lastTimestamp = null;
+      this.cancel();
       return;
     }
 
-    const deltaSeconds = deltaMs / 1000;
-    const nextTop = easeOutChase(
-      current,
-      this.target,
-      deltaSeconds,
-      motion,
-    );
-    const settled = Math.abs(this.target - nextTop) <= motion.settleDistancePx;
-    this.write(viewport, settled ? this.target : nextTop);
-
-    if (settled) {
-      this.phase = "idle";
-      this.lastTimestamp = null;
-      return;
-    }
+    const previousRemainingMs = Math.max(remainingMs, this.deadline - previousTimestamp);
+    const remainingFraction = (remainingMs / previousRemainingMs) ** 3;
+    const current = viewport.scrollTop;
+    this.write(viewport, this.target + (current - this.target) * remainingFraction);
+    this.lastTimestamp = timestamp;
     this.frameId = this.scheduler.request(this.advance);
   };
-
-  private currentMotion(kind: ThreadCameraMotionKind): ThreadCameraMotionProfile {
-    if (kind === "navigation") {
-      return this.prefersReducedMotion()
-        ? THREAD_CAMERA_REDUCED_NAVIGATION_MOTION
-        : THREAD_CAMERA_NAVIGATION_MOTION;
-    }
-    return this.prefersReducedMotion()
-      ? THREAD_CAMERA_REDUCED_MOTION
-      : THREAD_CAMERA_FOLLOW_MOTION;
-  }
 
   private write(viewport: ThreadCameraViewport, top: number): void {
     try {

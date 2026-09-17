@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from loguru import logger
 
@@ -40,13 +40,6 @@ LENGTH_RECOVERY_PROMPT = (
     "existing text, recap, or apologize."
 )
 
-SUSTAINED_GOAL_CONTINUE_PROMPT = (
-    "You have an active sustained goal. Please continue working toward the "
-    "objective using your tools, or call update_goal with action='complete' "
-    "if the work is truly finished."
-)
-
-
 def empty_tool_result_message(tool_name: str) -> str:
     """Short prompt-safe marker for tools that completed without visible output."""
     return f"({tool_name} completed with no output)"
@@ -61,10 +54,10 @@ def ensure_nonempty_tool_result(tool_name: str, content: Any) -> Any:
     if isinstance(content, list):
         if not content:
             return empty_tool_result_message(tool_name)
-        text_payload = stringify_text_blocks(content)
+        text_payload = stringify_text_blocks(cast(list[Any], content))
         if text_payload is not None and not text_payload.strip():
             return empty_tool_result_message(tool_name)
-    return content
+    return cast(Any, content)
 
 
 def is_blank_text(content: str | None) -> bool:
@@ -97,15 +90,11 @@ def build_length_recovery_message(content: str) -> dict[str, str]:
     return {"role": "user", "content": prompt}
 
 
-def build_goal_continue_message(custom: str | None = None) -> dict[str, str]:
-    """Prompt the model to continue when a sustained goal is still active."""
-    return {"role": "user", "content": custom or SUSTAINED_GOAL_CONTINUE_PROMPT}
-
-
 def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
     """Stable signature for repeated external lookups we want to throttle."""
     if not isinstance(arguments, dict):
         return None
+    arguments = cast(dict[str, Any], arguments)
     if tool_name == "web_fetch":
         url = str(arguments.get("url") or "").strip()
         if url:
@@ -153,6 +142,7 @@ def workspace_violation_signature(
     """Return a stable cross-tool signature for the outside-workspace target."""
     if not isinstance(arguments, dict):
         return None
+    arguments = cast(dict[str, Any], arguments)
     for key in ("path", "file_path", "target", "source", "destination"):
         val = arguments.get(key)
         if isinstance(val, str) and val.strip():
