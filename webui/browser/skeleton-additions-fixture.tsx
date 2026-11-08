@@ -37,9 +37,9 @@ const members: LinearMembersPayload = {
 const previewSettings: SettingsPayload = {
   ...settings,
   advanced: { ...settings.advanced, exec_max_runtime_limit: 86400 },
-  model_presets: [{ name: "default", model: "gpt-5.4", provider: "openai", resolved_provider: "openai", active: true, is_default: true,
-    max_tokens: 8192, context_window_tokens: 200_000, temperature: 0.1, reasoning_effort: null }],
-  model_call_order: ["default"],
+  model_presets: [{ name: "primary", model: "openai-codex/gpt-6.1-sol", provider: "openai", resolved_provider: "openai", active: true, is_default: false,
+    max_tokens: 8192, context_window_tokens: 500_000, temperature: 0.1, reasoning_effort: "max" }],
+  model_call_order: ["primary"],
   runtime_config: Object.fromEntries(RUNTIME_CONFIG_FIELDS.map((field) => [field.path,
     field.kind === "boolean" ? true : field.kind === "toggle" ? field.options?.[1] ?? "" : field.kind === "list" ? [] : field.kind === "number" ? 20 : field.kind === "duration" ? 3600 : field.kind === "idle-compaction" ? 15 : "",
   ])),
@@ -137,7 +137,7 @@ function SkeletonSurface() {
             : surface === "automations" ? <AutomationsSettings payload={empty ? null : { jobs }} loading={loading} filter="all" actionKey={null} error={state === "error" ? "Preview read failed" : null}
               onFilterChange={noop} onAction={noop} onRequestEdit={noop} onRequestDelete={noop} />
               : surface === "skill-detail" ? <SkillsCatalogSettings skills={[skill]} />
-                : surface === "session-jobs" ? <SessionInfoPopoverView title="Project review" jobs={empty ? [] : jobs} loading={loading} loadFailed={state === "error"} now={now}
+                : surface === "session-jobs" ? <SessionInfoPopoverView jobs={empty ? [] : jobs} loading={loading} loadFailed={state === "error"} now={now}
                   onAction={async () => jobs} onEdit={async () => jobs} />
                   : surface === "linear-members" ? <LinearMemberAccessView snapshot={{ payload: empty ? null : members, loading, error: state === "error" ? "Preview read failed" : null, saves: {} }} onLoad={noop} onSetAllowed={noop} /> : null}
         </main>}

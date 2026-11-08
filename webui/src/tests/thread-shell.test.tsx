@@ -947,7 +947,7 @@ describe("ThreadShell", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("renders each logical round in a completed turn as its own usage bar", async () => {
+  it("shows legacy history usage and clears it after successful compaction", async () => {
     const client = makeClient();
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       if (String(input).includes("websocket%3Ausage-chart/webui-thread")) {
@@ -1013,10 +1013,8 @@ describe("ThreadShell", () => {
 
     const trigger = await screen.findByTestId("composer-context-usage");
     fireEvent.click(trigger);
-    expect(await screen.findAllByTestId("round-usage-bar")).toHaveLength(4);
-    expect(screen.getByRole("img", {
-      name: /input tokens 16,400.*KV cache hit rate 99%.*output tokens 236/i,
-    })).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Context" })).toHaveAttribute("aria-valuenow", "22");
+    expect(screen.getByRole("button", { name: "Play context history" })).toBeDisabled();
     expect(screen.getByTestId("composer-context-meter")).toBeInTheDocument();
     for (const phase of ["started", "failed"] as const) {
       act(() => client._emitChat("usage-chart", {
@@ -1028,8 +1026,193 @@ describe("ThreadShell", () => {
       event: "context_compaction", chat_id: "usage-chart",
       compaction_id: "success", phase: "succeeded",
     }));
-    expect(trigger).toHaveAccessibleName("Open context usage");
-    expect(screen.getAllByTestId("round-usage-bar")).toHaveLength(4);
+    expect(screen.getByTestId("composer-context-usage")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("progressbar", { name: "Context" })).not.toHaveAttribute("aria-valuenow");
+    fireEvent.click(screen.getByTestId("composer-context-usage"));
+    await waitFor(() => expect(screen.queryByTestId("composer-context-usage")).not.toBeInTheDocument());
+  });
+
+  it("closes the context sidebar when starting a new conversation", async () => {
+    const client = makeClient();
+    const envelope = { chat_id: "live-usage", turn_id: "live-turn" };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => Promise.resolve(
+      String(input).includes("websocket%3Alive-usage/webui-thread")
+        ? httpJson({ schemaVersion: 3, projection: "events", active_turn_id: "live-turn", has_pending_tool_calls: true,
+            events: [{ ...envelope, event: "user_message", text: "Waiting for answer", starts_turn: true, turn_seq: 0 }] })
+        : { ok: false, status: 404, json: async () => ({}) },
+    )));
+    const footer = document.createElement("div");
+    document.body.append(footer);
+    const view = render(wrap(client, <ThreadShell composerPortalTarget={footer}
+      session={session("live-usage")} title="Live usage" onToggleSidebar={() => {}}
+      settingsSnapshot={modelSettings("test-model", "deepseek")} />));
+    await screen.findByText("Waiting for answer");
+    act(() => client._emitChat("live-usage", { ...envelope, event: "model_request", request_id: "first", run_id: "run",
+      phase: "completed", sequence: 1, turn_seq: 1, context_window_tokens: 1000,
+      usage: { prompt_tokens: 100, context_tokens: 100 },
+      context_graph: { nodes: [{ path: "/first.md", name: "first.md", state: "loaded", tokens: 40 }], edges: [] },
+    }));
+    const trigger = await screen.findByTestId("composer-context-usage");
+    const host = document.querySelector(".thread-preview-layout")!;
+    Object.defineProperty(host, "clientWidth", { value: 1000 });
+    fireEvent(window, new Event("resize"));
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("button", { name: "first.md" })).toBeInTheDocument();
+    expect(screen.getByTestId("context-sidebar")).toBeInTheDocument();
+    await act(async () => view.rerender(wrap(client, <ThreadShell composerPortalTarget={footer}
+      session={null} title="New conversation" onToggleSidebar={() => {}}
+      settingsSnapshot={modelSettings("test-model", "deepseek")} />)));
+    await waitFor(() => expect(screen.queryByTestId("context-sidebar")).not.toBeInTheDocument());
+    expect(footer).toContainElement(screen.getByRole("textbox"));
+    footer.remove();
+  });
+
+  it.each([false, true])("switches context in the same side slot unless multiple panes are visible (%s)", async (multiplePanes) => {
+    const geometry = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const bottom = this.classList.contains("thread-preview-layout") ? 900
+        : this.classList.contains("thread-composer-surface") && this.isConnected ? 880 : 0;
+      return DOMRect.fromRect({ x: 0, y: 0, width: 1000, height: bottom });
+    });
+    const client = makeClient();
+    const envelope = { chat_id: "live-usage", turn_id: "live-turn" };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => Promise.resolve(
+      String(input).includes("websocket%3Alive-usage/webui-thread")
+        ? httpJson({ schemaVersion: 3, projection: "events", active_turn_id: "live-turn", has_pending_tool_calls: true,
+            events: [{ ...envelope, event: "user_message", text: "Waiting for answer", starts_turn: true, turn_seq: 0 }] })
+        : { ok: false, status: 404, json: async () => ({}) },
+    )));
+    const footer = document.createElement("div");
+    document.body.append(footer);
+    const view = render(wrap(client, <ThreadShell
+      composerPortalTarget={footer} multiplePanes={multiplePanes}
+      session={session("live-usage")} title="Live usage" onToggleSidebar={() => {}}
+      settingsSnapshot={modelSettings("test-model", "deepseek")}
+    />));
+    await screen.findByText("Waiting for answer");
+    act(() => client._emitChat("live-usage", { ...envelope, event: "model_request", request_id: "first", run_id: "run",
+      phase: "completed", sequence: 1, turn_seq: 1, context_window_tokens: 1000,
+      usage: { prompt_tokens: 100, completion_tokens: 10, context_tokens: 100, request_count: 1 },
+      round_usages: [{ prompt_tokens: 100, completion_tokens: 10 }],
+      context_graph: { nodes: [{ path: "/first.md", name: "first.md", state: "loaded", tokens: 40 }], edges: [] },
+    }));
+    const trigger = await screen.findByTestId("composer-context-usage");
+    const input = screen.getByRole("textbox");
+    expect(footer).toContainElement(input);
+    const host = document.querySelector(".thread-preview-layout")!;
+    Object.defineProperty(host, "clientWidth", { value: 1000 });
+    fireEvent(window, new Event("resize"));
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("button", { name: "first.md" })).toBeInTheDocument();
+    expect((host as HTMLElement).style.getPropertyValue("--sidebar-bottom-inset")).toBe("20px");
+    const sidebar = screen.getByTestId("context-sidebar");
+    await act(async () => view.rerender(wrap(client, <ThreadShell
+      composerPortalTarget={footer} multiplePanes={multiplePanes}
+      session={session("other-usage")} title="Other usage" onToggleSidebar={() => {}}
+      settingsSnapshot={modelSettings("test-model", "deepseek")}
+    />)));
+    expect(screen.queryByRole("button", { name: "first.md" })).not.toBeInTheDocument();
+    if (!multiplePanes) {
+      expect(screen.getByTestId("context-sidebar")).toBe(sidebar);
+      expect(screen.getByRole("progressbar", { name: "Context" })).not.toHaveAttribute("aria-valuenow");
+      expect((host as HTMLElement).style.getPropertyValue("--sidebar-bottom-inset")).toBe("20px");
+    }
+    act(() => client._emitChat("other-usage", {
+      event: "model_request", chat_id: "other-usage", turn_id: "other-turn", request_id: "other", run_id: "other-run",
+      phase: "completed", sequence: 1, turn_seq: 1, context_window_tokens: 1000,
+      usage: { prompt_tokens: 200, context_tokens: 200 },
+      request_usage: { prompt_tokens: 200, context_tokens: 200 },
+      context_graph: { nodes: [{ path: "/other.md", name: "other.md", state: "loaded", tokens: 60 }], edges: [] },
+    }));
+    const newInput = screen.getByRole("textbox");
+    expect(newInput).not.toBe(input);
+    if (multiplePanes) {
+      await waitFor(() => expect(screen.queryByTestId("context-sidebar")).not.toBeInTheDocument());
+      expect(host).not.toHaveAttribute("data-preview-open");
+      expect(footer).toContainElement(newInput);
+      fireEvent.click(screen.getByTestId("composer-context-usage"));
+    } else {
+      expect(screen.getByTestId("context-sidebar")).toBe(sidebar);
+    }
+    expect(await screen.findByRole("button", { name: "other.md" })).toBeInTheDocument();
+    expect((host as HTMLElement).style.getPropertyValue("--sidebar-bottom-inset")).toBe("20px");
+    expect(screen.getByRole("progressbar", { name: "Context" })).toHaveAttribute("aria-valuenow", "20");
+    expect(host.querySelector(".thread-conversation")).toContainElement(newInput);
+    fireEvent.click(screen.getByTestId("composer-context-usage"));
+    await waitFor(() => expect(screen.queryByTestId("context-sidebar")).not.toBeInTheDocument());
+    await act(async () => view.rerender(wrap(client, <ThreadShell
+      composerPortalTarget={footer} multiplePanes={multiplePanes}
+      session={session("live-usage")} title="Live usage" onToggleSidebar={() => {}}
+      settingsSnapshot={modelSettings("test-model", "deepseek")}
+    />)));
+    expect(host).not.toHaveAttribute("data-preview-open");
+    expect(screen.queryByTestId("context-sidebar")).not.toBeInTheDocument();
+    view.unmount();
+    footer.remove();
+    geometry.mockRestore();
+  });
+
+  it("updates composer usage from active model snapshots without changing the body", async () => {
+    const client = makeClient();
+    const envelope = { chat_id: "live-usage", turn_id: "live-turn" };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => Promise.resolve(
+      String(input).includes("websocket%3Alive-usage/webui-thread")
+        ? httpJson({ schemaVersion: 3, projection: "events", active_turn_id: "live-turn", has_pending_tool_calls: true,
+            events: [{ ...envelope, event: "user_message", text: "Waiting for answer", starts_turn: true, turn_seq: 0 }] })
+        : { ok: false, status: 404, json: async () => ({}) },
+    )));
+    const footer = document.createElement("div");
+    document.body.append(footer);
+    const view = render(wrap(client, <ThreadShell
+      composerPortalTarget={footer}
+      session={session("live-usage")} title="Live usage" onToggleSidebar={() => {}}
+      settingsSnapshot={modelSettings("test-model", "deepseek")}
+    />));
+    await screen.findByText("Waiting for answer");
+    act(() => client._emitChat("live-usage", { ...envelope, event: "model_request", request_id: "first", run_id: "run",
+      phase: "completed", sequence: 1, turn_seq: 1, context_window_tokens: 1000,
+      usage: { prompt_tokens: 100, completion_tokens: 10, context_tokens: 100, request_count: 1 },
+      round_usages: [{ prompt_tokens: 100, completion_tokens: 10 }],
+      context_graph: { nodes: [{ path: "/first.md", name: "first.md", state: "loaded", tokens: 40 }], edges: [] },
+    }));
+    const trigger = await screen.findByTestId("composer-context-usage");
+    expect(trigger).toHaveAccessibleName("Context 10%. Open context usage");
+    act(() => client._emitChat("live-usage", { ...envelope, event: "model_request", request_id: "second", run_id: "run",
+      phase: "completed", sequence: 2, turn_seq: 2, context_window_tokens: 1000,
+      usage: { prompt_tokens: 300, completion_tokens: 20, context_tokens: 200, request_count: 2 },
+      round_usages: [{ prompt_tokens: 100, completion_tokens: 10 }, { prompt_tokens: 200, completion_tokens: 10 }],
+      context_graph: { nodes: [{ path: "/second.md", name: "second.md", state: "loaded", tokens: 60 }], edges: [] },
+    }));
+    expect(trigger).toHaveAccessibleName("Context 20%. Open context usage");
+    const input = screen.getByRole("textbox");
+    expect(footer).toContainElement(input);
+    fireEvent.change(input, { target: { value: "Preserve this draft" } });
+    const host = document.querySelector(".thread-preview-layout")!;
+    Object.defineProperty(host, "clientWidth", { value: 1000 });
+    fireEvent(window, new Event("resize"));
+    act(() => input.focus());
+    fireEvent.click(trigger);
+    expect(host.querySelector(".thread-conversation")).toContainElement(input);
+    expect(footer).not.toContainElement(input);
+    expect(input).toHaveValue("Preserve this draft");
+    expect(input).toHaveFocus();
+    expect(screen.getByRole("progressbar", { name: "Context" })).toHaveAttribute("aria-valuenow", "20");
+    expect(await screen.findByRole("button", { name: "second.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Play context history" })).toBeEnabled();
+    expect(screen.getByText("Waiting for answer")).toBeInTheDocument();
+    const sidebar = screen.getByTestId("context-sidebar");
+    // HappyDOM has no CSS timeline; retain a real pending exit for the close assertions.
+    let finishExit!: () => void;
+    const finished = new Promise<void>((resolve) => { finishExit = resolve; });
+    Object.defineProperty(sidebar, "getAnimations", { value: () => [{ finished }] });
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("context-sidebar")).toBe(sidebar);
+    expect(sidebar).toHaveAttribute("data-closing");
+    expect(footer).toContainElement(input);
+    expect(input).toHaveValue("Preserve this draft");
+    await act(async () => finishExit());
+    await waitFor(() => expect(screen.queryByTestId("context-sidebar")).not.toBeInTheDocument());
+    view.unmount();
+    footer.remove();
   });
 
   it.each([false, true])("restores context after compaction only with newer usage (%s)", async (newReply) => {
@@ -1058,11 +1241,12 @@ describe("ThreadShell", () => {
       session={session("compact-usage")} title="Compact usage" onToggleSidebar={() => {}}
       settingsSnapshot={modelSettings("test-model", "deepseek")}
     />));
-    const trigger = await screen.findByTestId("composer-context-usage");
+    await screen.findByText("Before compact");
     if (newReply) {
+      const trigger = await screen.findByTestId("composer-context-usage");
       expect(trigger).toHaveAccessibleName("Context 2%. Open context usage");
     } else {
-      expect(trigger).toHaveAccessibleName("Open context usage");
+      expect(screen.queryByTestId("composer-context-usage")).not.toBeInTheDocument();
     }
   });
 
@@ -1112,7 +1296,10 @@ describe("ThreadShell", () => {
     portal.remove();
   });
 
-  it("keeps inferred file paths non-interactive when the availability probe fails", async () => {
+  it.each([
+    { kind: "inferred", content: "Unreadable file: `prompts/dream.md`", path: "prompts/dream.md" },
+    { kind: "explicit", content: "[Python code](／home/example/workspace/model_check.py)", path: "／home/example/workspace/model_check.py" },
+  ])("keeps $kind file references non-interactive when the availability probe fails", async ({ content, path }) => {
     await preloadMarkdownText();
     const client = makeClient();
     let resolveProbe!: (value: Response) => void;
@@ -1123,7 +1310,7 @@ describe("ThreadShell", () => {
       const url = String(input);
       if (url.includes("websocket%3Apreview-error/webui-thread")) {
         return Promise.resolve(httpJson(transcriptFromSimpleMessages([
-          { role: "assistant", content: "Unreadable file: `prompts/dream.md`" },
+          { role: "assistant", content },
         ])));
       }
       if (url.includes("websocket%3Apreview-error/file-preview?")) return probe;
@@ -1146,7 +1333,7 @@ describe("ThreadShell", () => {
 
     const reference = await screen.findByTestId("inline-file-path");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("file-preview?path=prompts%2Fdream.md&probe=1"),
+      expect.stringContaining(`file-preview?path=${encodeURIComponent(path)}&probe=1`),
       expect.anything(),
     ));
     await act(async () => {
@@ -1221,22 +1408,19 @@ describe("ThreadShell", () => {
 
   it("does not navigate away when clicking the chat title", async () => {
     const client = makeClient();
-    const onGoHome = vi.fn();
     render(wrap(
       client,
       <ThreadShell
         session={session("chat-title")}
         title="Important conversation"
         onToggleSidebar={() => {}}
-        onGoHome={onGoHome}
-        onNewChat={() => {}}
       />,
     ));
 
     await waitFor(() => expect(screen.getByText("Important conversation")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Important conversation"));
 
-    expect(onGoHome).not.toHaveBeenCalled();
+    expect(screen.getByText("Important conversation")).toBeVisible();
   });
 
   it.each([true, false])("waits for parent settings and retries only on failure (success: %s)", async (success) => {
@@ -1555,7 +1739,6 @@ describe("ThreadShell", () => {
     expect(client.sendSystemCommand).not.toHaveBeenCalled();
     emit("notice-a", true);
     expect(notice()).not.toBeInTheDocument();
-    // A new turn can notify again; it does not inherit the previous dismissal.
     emit("notice-a", false);
     emit("notice-a", true);
     expect(notice()).toBeVisible();
@@ -1768,7 +1951,6 @@ describe("ThreadShell", () => {
 
   it("restores in-memory messages when switching away and back to a session", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     const { rerender } = render(
       wrap(
@@ -1777,8 +1959,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -1801,8 +1981,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -1816,8 +1994,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -1988,7 +2164,6 @@ describe("ThreadShell", () => {
 
   it("clears the old thread when the active session is removed", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     const { rerender } = render(
       wrap(
@@ -1997,8 +2172,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -2021,8 +2194,6 @@ describe("ThreadShell", () => {
             session={null}
             title="nanobot"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2036,7 +2207,6 @@ describe("ThreadShell", () => {
 
   it("creates a chat only when the blank landing sends a first message", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn();
     const onCreateChat = vi.fn().mockResolvedValue("chat-new");
 
     render(
@@ -2046,8 +2216,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
           onCreateChat={onCreateChat}
         />,
       ),
@@ -2060,7 +2228,6 @@ describe("ThreadShell", () => {
 
     await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
     expect(onCreateChat).toHaveBeenCalledWith(null, "start for real", null);
-    expect(onNewChat).not.toHaveBeenCalled();
   });
 
   it("applies the selected landing preset before sending the first prompt", async () => {
@@ -2377,8 +2544,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2394,7 +2559,6 @@ describe("ThreadShell", () => {
 
   it("does not leak the previous thread when opening a brand-new chat", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-new");
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -2422,8 +2586,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -2438,8 +2600,6 @@ describe("ThreadShell", () => {
             session={session("chat-new")}
             title="Chat chat-new"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2450,7 +2610,7 @@ describe("ThreadShell", () => {
       expect(screen.getByRole("textbox")).toBeInTheDocument(),
     );
     const input = screen.getByRole("textbox");
-    expect(input).toHaveAttribute("placeholder", "Describe what you’d like to do");
+    expect(input).toHaveAttribute("placeholder", "Type / for commands, @ for chats or apps, $ for skills");
     expect(input.className).toContain("min-h-[78px]");
     expect(screen.queryByText("old answer")).not.toBeInTheDocument();
   });
@@ -2507,7 +2667,6 @@ describe("ThreadShell", () => {
 
   it("does not cache optimistic messages under the next chat during a session switch", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-b");
 
     const { rerender } = render(
       wrap(
@@ -2516,8 +2675,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -2540,8 +2697,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2559,8 +2714,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2576,8 +2729,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2612,7 +2763,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2635,7 +2785,6 @@ describe("ThreadShell", () => {
             session={null}
             title="nanobot"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -2652,7 +2801,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -2669,7 +2817,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("chat-a"));
@@ -2731,7 +2878,6 @@ describe("ThreadShell", () => {
           session={session("chat-fork")}
           title="Chat chat-fork"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2808,7 +2954,6 @@ describe("ThreadShell", () => {
           session={session("resume-chat")}
           title="Resume chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2861,7 +3006,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Cached completion"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("question");
     act(() => {
@@ -2913,7 +3058,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Published completion"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("question");
     act(() => {
@@ -2989,7 +3134,6 @@ describe("ThreadShell", () => {
           session={session("mount-during-reconnect")}
           title="Mount during reconnect"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3055,7 +3199,6 @@ describe("ThreadShell", () => {
           session={session("window-reset-chat")}
           title="Window reset"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3119,7 +3262,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("lineage-chat-a"));
@@ -3175,7 +3317,6 @@ describe("ThreadShell", () => {
           session={session("reset-tail-race")}
           title="Reset tail race"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3237,7 +3378,6 @@ describe("ThreadShell", () => {
           session={session("empty-reset-chat")}
           title="Empty reset"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3316,7 +3456,6 @@ describe("ThreadShell", () => {
             session={session("strict-canonical")}
             title="Strict canonical"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />
         </StrictMode>,
       ),
@@ -3383,7 +3522,7 @@ describe("ThreadShell", () => {
       return Promise.resolve(httpJson(completedBody(true)));
     }));
     render(wrap(client, <ThreadShell session={session(chatId)} title="Layout recheck"
-      onToggleSidebar={() => {}} onNewChat={() => {}} />));
+      onToggleSidebar={() => {}} />));
     await screen.findByText("layout question");
     act(() => {
       client._emitChat(chatId, {
@@ -3473,7 +3612,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("chat-version-a"));
@@ -3559,7 +3697,6 @@ describe("ThreadShell", () => {
           session={session("run-generation-chat")}
           title="Run generation chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3623,7 +3760,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Guided turn"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("guided question");
     act(() => {
@@ -3752,7 +3889,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Completed latest window" messageCache={messageCache}
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     const completed = await screen.findByText("completed reply");
     const older = screen.getByText("older paginated answer");
@@ -3817,7 +3954,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Completed paged guidance" messageCache={messageCache}
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("completed last");
     const messages = [
@@ -3859,7 +3996,6 @@ describe("ThreadShell", () => {
       session={session("initial-completion")}
       title="Initial completion"
       onToggleSidebar={() => {}}
-      onNewChat={() => {}}
     />));
     await screen.findByText("previous question");
     act(() => client._emitChat("initial-completion", {
@@ -3912,7 +4048,6 @@ describe("ThreadShell", () => {
           session={session("late-frame-chat")}
           title="Late frame chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4003,7 +4138,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("visibility-complete-a"));
@@ -4063,7 +4197,6 @@ describe("ThreadShell", () => {
           session={session("empty-answer")}
           title="Empty answer"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4123,7 +4256,7 @@ describe("ThreadShell", () => {
 
       render(wrap(client, <ThreadShell
         session={session(chatId)} title="Running history"
-        onToggleSidebar={() => {}} onNewChat={() => {}}
+        onToggleSidebar={() => {}}
       />));
 
       await screen.findByText("previous answer");
@@ -4277,7 +4410,7 @@ describe("ThreadShell", () => {
     }));
     const { container } = render(wrap(client, <ThreadShell
       session={session(chatId)} title="Running paged history"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("current question");
     act(() => client._emitChat(chatId, {
@@ -4345,8 +4478,6 @@ describe("ThreadShell", () => {
           session={session("before-delta-chat")}
           title="Before delta chat"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4445,7 +4576,6 @@ describe("ThreadShell", () => {
           session={session("active-resume-chat")}
           title="Active resume chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4532,7 +4662,6 @@ describe("ThreadShell", () => {
           session={session("timing-chat")}
           title="Timing chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4618,7 +4747,6 @@ describe("ThreadShell", () => {
             session={session("visible-chat")}
             title="Visible chat"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4682,7 +4810,6 @@ describe("ThreadShell", () => {
             session={session("idle-visible-chat")}
             title="Idle visible chat"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4739,7 +4866,6 @@ describe("ThreadShell", () => {
             session={session("retry-visible-chat")}
             title="Retry visible chat"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4795,7 +4921,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4855,7 +4980,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4906,7 +5030,6 @@ describe("ThreadShell", () => {
         session={session("token-media")}
         title="Token media"
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
       null,
       token,
@@ -4960,7 +5083,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -5023,7 +5145,6 @@ describe("ThreadShell", () => {
             session={session("chat-follow")}
             title="Chat follow"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -5119,7 +5240,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5142,7 +5262,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -5188,7 +5307,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5210,7 +5328,6 @@ describe("ThreadShell", () => {
 
   it("surfaces a dismissible banner for an uncorrelated message_too_big error", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     render(
       wrap(
@@ -5219,13 +5336,10 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
 
-    // No banner yet: only appears once the client emits a matching error.
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
     await act(async () => {});
@@ -5256,8 +5370,6 @@ describe("ThreadShell", () => {
           session={session("chat-model-failure")}
           title="Chat model failure"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5277,7 +5389,7 @@ describe("ThreadShell", () => {
     });
 
     const banner = await screen.findByRole("alert");
-    expect(banner).toHaveTextContent("无法连接模型提供商");
+    expect(banner).toHaveTextContent("模型连接异常");
     expect(banner).toHaveTextContent(
       "已尝试 4 次，仍未成功。可稍后继续或切换模型。",
     );
@@ -5294,7 +5406,7 @@ describe("ThreadShell", () => {
         });
       });
       expect(screen.getAllByRole("alert")).toHaveLength(1);
-      expect(screen.getByRole("alert")).toHaveTextContent("无法连接模型提供商");
+      expect(screen.getByRole("alert")).toHaveTextContent("模型连接异常");
       expect(screen.getByRole("button", { name: "继续" })).toBeEnabled();
     }
 
@@ -5347,8 +5459,6 @@ describe("ThreadShell", () => {
           session={session("chat-inline-error")}
           title="Chat inline error"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5385,7 +5495,6 @@ describe("ThreadShell", () => {
 
   it("clears the stream error banner when the user switches to another chat", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     const { rerender } = render(
       wrap(
@@ -5394,8 +5503,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -5416,8 +5523,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -5430,7 +5535,6 @@ describe("ThreadShell", () => {
 
   it("clears the previous thread immediately while the next session loads", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-b");
     let resolveChatB:
       | ((value: { ok: boolean; status: number; json: () => Promise<unknown> }) => void)
       | null = null;
@@ -5465,8 +5569,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -5481,8 +5583,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -5556,8 +5656,6 @@ describe("ThreadShell", () => {
       session={session("lazy-mentions")}
       title="Lazy mentions"
       onToggleSidebar={() => {}}
-      onGoHome={() => {}}
-      onNewChat={() => {}}
     />));
     const input = await screen.findByLabelText("Message input");
     const catalogCalls = () => vi.mocked(fetch).mock.calls.filter(([url]) =>
@@ -5580,8 +5678,6 @@ describe("ThreadShell", () => {
       session={session("retry-mentions")}
       title="Retry mentions"
       onToggleSidebar={() => {}}
-      onGoHome={() => {}}
-      onNewChat={() => {}}
     />));
     const input = await screen.findByLabelText("Message input");
     const catalogCalls = () => vi.mocked(fetch).mock.calls.filter(([url]) =>
@@ -5605,8 +5701,6 @@ describe("ThreadShell", () => {
         session={session("chat-cli-apps")}
         title="Chat chat-cli-apps"
         onToggleSidebar={() => {}}
-        onGoHome={() => {}}
-        onNewChat={() => {}}
       />,
     ));
 
@@ -5665,8 +5759,6 @@ describe("ThreadShell", () => {
         session={session("chat-cli-race")}
         title="Chat chat-cli-race"
         onToggleSidebar={() => {}}
-        onGoHome={() => {}}
-        onNewChat={() => {}}
       />,
     ));
 
@@ -5745,8 +5837,6 @@ describe("ThreadShell", () => {
         session={session("chat-cli-refresh")}
         title="Chat chat-cli-refresh"
         onToggleSidebar={() => {}}
-        onGoHome={() => {}}
-        onNewChat={() => {}}
       />,
     ));
 
@@ -5816,7 +5906,7 @@ describe("ThreadShell", () => {
     expect(screen.getByRole("option", { name: /Other project/i })).toBeInTheDocument();
   });
 
-  it("allows project selection before first input and locks it after acceptance without duplicating the sidebar label", async () => {
+  it.each([true, undefined])("locks saved topics with projectLocked=%s independently of displayed history", async (projectLocked) => {
     const client = makeClient();
     const scope = { project_path: "/srv/alpha", project_name: "alpha", access_mode: "restricted" as const };
     const props = {
@@ -5828,7 +5918,7 @@ describe("ThreadShell", () => {
     expect(await screen.findByRole("button", { name: "Switch directory" })).toBeEnabled();
     expect(screen.getByTestId("thread-header")).not.toHaveTextContent("alpha");
 
-    rerender(wrap(client, <ThreadShell {...props} session={{ ...session("project-chat"), projectLocked: true }} />));
+    rerender(wrap(client, <ThreadShell {...props} session={{ ...session("project-chat"), projectLocked }} />));
     expect(screen.queryByRole("button", { name: "Switch directory" })).not.toBeInTheDocument();
     expect(screen.getByTestId("thread-header")).not.toHaveTextContent("alpha");
     expect(screen.getByRole("button", { name: "Workspace access mode: Default Permission" })).toBeEnabled();
